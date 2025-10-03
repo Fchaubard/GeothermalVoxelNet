@@ -1,175 +1,286 @@
-"""Full autoregressive rollout inference on a single simulation."""
+"""
+Full autoregressive rollout inference on original HDF5 simulations.
+
+Runs the model autoregressively using its own predictions (no ground truth reset).
+This simulates real deployment where we only have initial conditions.
+"""
 import os
 import json
 import argparse
 import h5py
 import torch
 import numpy as np
+from tqdm import tqdm
 
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from voxel_ode.model import VoxelAutoRegressor
+from voxel_ode.data_prep import STATIC_KEYS
 
 
-def load_stats(stats_path, device):
-    """Load and convert statistics to tensors."""
-    with open(stats_path, "r") as f:
-        stats = json.load(f)
-
-    stats_t = {
-        "static_mean": torch.tensor(stats["mean"]["static"], device=device).view(-1, 1, 1, 1),
-        "static_std": torch.tensor(stats["std"]["static"], device=device).view(-1, 1, 1, 1).clamp(min=1e-6),
-        "grid_mean": torch.tensor(stats["mean"]["grid"], device=device).view(1, 2, 1, 1, 1),
-        "grid_std": torch.tensor(stats["std"]["grid"], device=device).view(1, 2, 1, 1, 1).clamp(min=1e-6),
-        "scalar_mean": torch.tensor(stats["mean"]["scalar"], device=device).view(1, 5),
-        "scalar_std": torch.tensor(stats["std"]["scalar"], device=device).view(1, 5).clamp(min=1e-6),
-        "scalar_log1p_flags": stats["log1p_flags"]["scalar"],
-        "static_channels": stats["static_channels"],
-    }
-    return stats_t
-
-
-@torch.no_grad()
-def autoregressive_rollout(
-    sim_path,
-    stats_path,
-    ckpt_path,
-    save_path,
-    r=2,
-    base_channels=64,
-    depth=8,
-    use_param_broadcast=False,
-    device='cuda'
-):
-    """
-    Perform full autoregressive rollout on a single simulation.
-
-    Args:
-        sim_path: Path to prepped .h5 file
-        stats_path: Path to stats.json
-        ckpt_path: Path to model checkpoint
-        save_path: Where to save predictions
-        r, base_channels, depth: Model architecture params
-        use_param_broadcast: Whether params are broadcast as channels
-        device: Device to run on
-    """
-    device = torch.device(device if torch.cuda.is_available() else 'cpu')
-    stats = load_stats(stats_path, device=device)
-
-    # Load simulation data
-    with h5py.File(sim_path, "r") as f:
-        static = torch.tensor(f["static"][...], dtype=torch.float32, device=device)
-        params = torch.tensor(f["params_scalar"][...], dtype=torch.float32, device=device).unsqueeze(0)
-        outputs_grid_true = f["outputs_grid"][...]  # (T, 2, Z, Y, X)
-        outputs_scalar_true = f["outputs_scalar"][...]  # (T, 5)
-
-    T, _, Z, Y, X = outputs_grid_true.shape
-    C_static = static.shape[0]
-    in_channels = C_static + 2 + (26 if use_param_broadcast else 0)
-
-    # Create model
+def load_model(ckpt_path, r, base_channels, depth, in_channels, device):
+    """Load trained model from checkpoint."""
     model = VoxelAutoRegressor(
         in_channels=in_channels,
         base_channels=base_channels,
         depth=depth,
         r=r,
-        cond_params_dim=26,
-        use_param_broadcast=use_param_broadcast,
-        grid_out_channels=2,
-        scalar_out_dim=5,
+        use_param_broadcast=False,
     ).to(device)
 
-    # Load checkpoint
     ckpt = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(ckpt["model"])
+    if "model" in ckpt:
+        model.load_state_dict(ckpt["model"])
+    else:
+        model.load_state_dict(ckpt)
+
     model.eval()
+    return model
 
-    print(f"Loaded model from {ckpt_path}")
-    print(f"Rolling out {T} timesteps for grid shape ({Z}, {Y}, {X})")
 
-    # Standardize static once
-    static_norm = (static - stats["static_mean"]) / stats["static_std"]
+def load_stats(stats_path):
+    """Load normalization statistics."""
+    with open(stats_path, "r") as f:
+        stats = json.load(f)
+    return stats
 
-    # Prediction arrays
-    pred_grid = np.zeros_like(outputs_grid_true, dtype=np.float32)
-    pred_scalar = np.zeros_like(outputs_scalar_true, dtype=np.float32)
 
-    # Initialize with true t=0
-    pred_grid[0] = outputs_grid_true[0]
-    pred_scalar[0] = outputs_scalar_true[0]
+def normalize_static(static, stats, device):
+    """Normalize static channels: [C, Z, Y, X] -> tensor."""
+    x = torch.from_numpy(static).float().to(device)
+    mean = torch.tensor(stats["mean"]["static"], device=device).view(-1, 1, 1, 1)
+    std = torch.tensor(stats["std"]["static"], device=device).view(-1, 1, 1, 1).clamp(min=1e-6)
+    return (x - mean) / std
+
+
+def normalize_grid(grid, ch, stats, device):
+    """Normalize grid (Pressure or Temperature): [Z, Y, X] -> tensor."""
+    x = torch.from_numpy(grid).float().to(device)
+    mean = stats["mean"]["grid"][ch]
+    std = max(stats["std"]["grid"][ch], 1e-6)
+    return (x - mean) / std
+
+
+def denormalize_grid(grid_norm, ch, stats):
+    """Denormalize grid from normalized space to physical units."""
+    mean = stats["mean"]["grid"][ch]
+    std = max(stats["std"]["grid"][ch], 1e-6)
+    return grid_norm * std + mean
+
+
+def denormalize_scalar(scalar_norm, ch, stats):
+    """Denormalize scalar from normalized space to physical units."""
+    mean = stats["mean"]["scalar"][ch]
+    std = max(stats["std"]["scalar"][ch], 1e-6)
+    val = scalar_norm * std + mean
+    # Inverse log1p if needed
+    if stats["log1p_flags"]["scalar"][ch]:
+        val = np.expm1(val)
+    return val
+
+
+@torch.no_grad()
+def rollout(
+    sim_path,
+    stats_path,
+    ckpt_path,
+    save_path,
+    r=3,
+    base_channels=128,
+    depth=12,
+    device='cuda'
+):
+    """
+    Autoregressive rollout on full simulation.
+
+    Uses model's own predictions (no ground truth reset).
+    Evaluates error accumulation over time.
+    """
+    print(f"Loading simulation: {sim_path}")
+    print(f"Loading stats: {stats_path}")
+    print(f"Loading checkpoint: {ckpt_path}")
+
+    # Load stats
+    stats = load_stats(stats_path)
+
+    # Load simulation
+    with h5py.File(sim_path, "r") as f:
+        # Static inputs
+        static_list = []
+        for k in STATIC_KEYS:
+            static_list.append(f[f"Input/{k}"][...])
+        static = np.stack(static_list, axis=0)  # [C_static, Z, Y, X]
+
+        params = f["Input/ParamsScalar"][...].astype(np.float32)
+
+        # Initial conditions (t=0)
+        P0 = f["Input/Pressure0"][...]
+        T0 = f["Input/Temperature0"][...]
+
+        # Ground truth outputs for evaluation
+        P_true = f["Output/Pressure"][...]  # [T, Z, Y, X]
+        T_true = f["Output/Temperature"][...]  # [T, Z, Y, X]
+
+        # Scalar outputs
+        scalar_keys = [
+            "FieldEnergyInjectionRate",
+            "FieldEnergyProductionRate",
+            "FieldEnergyProductionTotal",
+            "FieldWaterInjectionRate",
+            "FieldWaterProductionRate"
+        ]
+        scalars_true = np.stack([f[f"Output/{k}"][...] for k in scalar_keys], axis=-1)  # [T, 5]
+
+    T, Z, Y, X = P_true.shape
+    C_static = len(STATIC_KEYS)
+    in_channels = C_static + 2  # static + P + T
+
+    print(f"\nSimulation shape: {T} timesteps, {Z}×{Y}×{X} grid")
+    print(f"Input channels: {in_channels} ({C_static} static + 2 lagged)")
+
+    # Load model
+    model = load_model(ckpt_path, r, base_channels, depth, in_channels, device)
+    print(f"Model loaded: {sum(p.numel() for p in model.parameters())/1e6:.2f}M parameters")
+
+    # Normalize static inputs (stays constant)
+    static_norm = normalize_static(static, stats, device).unsqueeze(0)  # [1, C_static, Z, Y, X]
+    params_t = torch.from_numpy(params).float().to(device).unsqueeze(0)  # [1, 26]
+
+    # Storage for predictions
+    P_pred = np.zeros((T, Z, Y, X), dtype=np.float32)
+    T_pred = np.zeros((T, Z, Y, X), dtype=np.float32)
+    scalars_pred = np.zeros((T, 5), dtype=np.float32)
+
+    # Initialize with ground truth at t=0
+    P_pred[0] = P0
+    T_pred[0] = T0
+    # Note: scalars at t=0 are outputs, not initial conditions
+    # We'll predict them in the first step
 
     # Autoregressive rollout
-    for t in range(T - 1):
-        # Use ground truth at time t as input
-        p_t = torch.tensor(outputs_grid_true[t, 0], dtype=torch.float32, device=device)
-        T_t = torch.tensor(outputs_grid_true[t, 1], dtype=torch.float32, device=device)
+    print(f"\nRunning autoregressive rollout ({T-1} predictions)...")
 
-        # Standardize
-        p_t = (p_t - stats["grid_mean"][0, 0]) / stats["grid_std"][0, 0]
-        T_t = (T_t - stats["grid_mean"][0, 1]) / stats["grid_std"][0, 1]
+    # Current state (starts with initial conditions)
+    P_current = P0
+    T_current = T0
 
-        # Build input
-        x_grid = torch.cat([static_norm, p_t.unsqueeze(0), T_t.unsqueeze(0)], dim=0)
+    metrics_per_timestep = []
 
-        if use_param_broadcast:
-            Bc = params[0].view(-1, 1, 1, 1).expand(-1, Z, Y, X)
-            x_grid = torch.cat([x_grid, Bc], dim=0)
+    for t in tqdm(range(T)):
+        # Normalize current state
+        P_norm = normalize_grid(P_current, 0, stats, device).unsqueeze(0).unsqueeze(0)  # [1, 1, Z, Y, X]
+        T_norm = normalize_grid(T_current, 1, stats, device).unsqueeze(0).unsqueeze(0)  # [1, 1, Z, Y, X]
 
-        x_grid = x_grid.unsqueeze(0)  # [1, C_in, Z, Y, X]
+        # Concatenate inputs: [1, C_in, Z, Y, X]
+        x_grid = torch.cat([static_norm, P_norm, T_norm], dim=1)
 
-        # Predict t+1
-        grid_pred_norm, scalar_pred_norm = model(x_grid, params)
+        # Predict next state
+        grid_pred_norm, scalar_pred_norm = model(x_grid, params_t)
 
-        # De-normalize grid
-        grid_pred = (grid_pred_norm * stats["grid_std"] + stats["grid_mean"]).squeeze(0).cpu().numpy()
+        # Denormalize predictions
+        P_next = denormalize_grid(grid_pred_norm[0, 0].cpu().numpy(), 0, stats)
+        T_next = denormalize_grid(grid_pred_norm[0, 1].cpu().numpy(), 1, stats)
+        scalars_next = np.array([
+            denormalize_scalar(scalar_pred_norm[0, i].cpu().item(), i, stats)
+            for i in range(5)
+        ])
 
-        # De-normalize scalars
-        scalar_pred = (scalar_pred_norm * stats["scalar_std"] + stats["scalar_mean"]).squeeze(0)
-        for k, flag in enumerate(stats["scalar_log1p_flags"]):
-            if flag:
-                scalar_pred[k] = torch.expm1(scalar_pred[k])
+        # Store predictions
+        if t < T - 1:  # We predict t+1, so for t=T-1, we predict beyond available data
+            P_pred[t + 1] = P_next
+            T_pred[t + 1] = T_next
+            scalars_pred[t] = scalars_next
 
-        pred_grid[t + 1] = grid_pred
-        pred_scalar[t + 1] = scalar_pred.cpu().numpy()
+            # Compute metrics vs ground truth
+            mse_p = np.mean((P_next - P_true[t + 1]) ** 2)
+            mse_t = np.mean((T_next - T_true[t + 1]) ** 2)
+            mse_scalars = np.mean((scalars_next - scalars_true[t]) ** 2)
 
-        if (t + 1) % 10 == 0:
-            print(f"  Completed timestep {t+1}/{T-1}")
+            # Relative error (mean absolute percentage error)
+            mape_p = np.mean(np.abs((P_next - P_true[t + 1]) / (np.abs(P_true[t + 1]) + 1e-8))) * 100
+            mape_t = np.mean(np.abs((T_next - T_true[t + 1]) / (np.abs(T_true[t + 1]) + 1e-8))) * 100
+
+            metrics_per_timestep.append({
+                't': t,
+                'mse_pressure': float(mse_p),
+                'mse_temperature': float(mse_t),
+                'mse_scalars': float(mse_scalars),
+                'mape_pressure': float(mape_p),
+                'mape_temperature': float(mape_t),
+            })
+
+            # Use prediction as input for next timestep (autoregressive)
+            P_current = P_next
+            T_current = T_next
+        else:
+            # Last timestep: predict scalars only
+            scalars_pred[t] = scalars_next
+
+    # Compute overall metrics
+    print("\n=== Overall Metrics ===")
+    mse_p_all = np.mean((P_pred[1:] - P_true[1:]) ** 2)
+    mse_t_all = np.mean((T_pred[1:] - T_true[1:]) ** 2)
+    mse_scalars_all = np.mean((scalars_pred - scalars_true) ** 2)
+
+    print(f"Pressure MSE:     {mse_p_all:.6e}")
+    print(f"Temperature MSE:  {mse_t_all:.6e}")
+    print(f"Scalars MSE:      {mse_scalars_all:.6e}")
+
+    # Show error growth over time
+    print("\n=== Error Accumulation ===")
+    print("Timestep | Pressure MSE | Temperature MSE | Pressure MAPE | Temperature MAPE")
+    print("-" * 80)
+    for i in [0, 4, 9, 14, 19, 24, 28]:  # Sample timesteps
+        if i < len(metrics_per_timestep):
+            m = metrics_per_timestep[i]
+            print(f"t={m['t']:2d}      | {m['mse_pressure']:12.6e} | {m['mse_temperature']:15.6e} | {m['mape_pressure']:13.2f}% | {m['mape_temperature']:16.2f}%")
 
     # Save predictions
-    with h5py.File(save_path, "w") as g:
-        g.create_dataset("predicted/outputs_grid", data=pred_grid, compression="gzip", compression_opts=4)
-        g.create_dataset("predicted/outputs_scalar", data=pred_scalar, compression="gzip", compression_opts=4)
-        g.create_dataset("copied/params_scalar", data=params.squeeze(0).cpu().numpy())
-        g.create_dataset("copied/static_shape", data=np.array([C_static, Z, Y, X], dtype=np.int32))
-        g.attrs["source_sim"] = sim_path
-        g.attrs["ckpt_path"] = ckpt_path
+    print(f"\nSaving predictions to: {save_path}")
+    with h5py.File(save_path, "w") as f:
+        f.create_dataset("predicted/Pressure", data=P_pred, compression="gzip")
+        f.create_dataset("predicted/Temperature", data=T_pred, compression="gzip")
+        f.create_dataset("predicted/scalars", data=scalars_pred, compression="gzip")
 
-    print(f"\nSaved rollout predictions to: {save_path}")
+        # Also save ground truth for comparison
+        f.create_dataset("ground_truth/Pressure", data=P_true, compression="gzip")
+        f.create_dataset("ground_truth/Temperature", data=T_true, compression="gzip")
+        f.create_dataset("ground_truth/scalars", data=scalars_true, compression="gzip")
+
+        # Save metrics
+        import json
+        f.attrs["metrics_overall"] = json.dumps({
+            "mse_pressure": float(mse_p_all),
+            "mse_temperature": float(mse_t_all),
+            "mse_scalars": float(mse_scalars_all),
+        })
+        f.attrs["metrics_per_timestep"] = json.dumps(metrics_per_timestep)
+
+    print(f"Done! Predictions saved with ground truth for comparison.")
+    return metrics_per_timestep
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Autoregressive rollout inference")
-    ap.add_argument("--prepped_sim_path", type=str, required=True)
-    ap.add_argument("--stats_path", type=str, required=True)
-    ap.add_argument("--ckpt_path", type=str, required=True)
-    ap.add_argument("--save_path", type=str, required=True)
-    ap.add_argument("--receptive_field_radius", type=int, default=2, help="Receptive field radius")
-    ap.add_argument("--base_channels", type=int, default=64)
-    ap.add_argument("--depth", type=int, default=8)
-    ap.add_argument("--use_param_broadcast", action="store_true")
-    ap.add_argument("--device", type=str, default="cuda")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser(description="Autoregressive rollout inference")
+    parser.add_argument("--sim_path", type=str, required=True, help="Path to original v2.4 HDF5 file")
+    parser.add_argument("--stats_path", type=str, required=True, help="Path to stats.json from prep")
+    parser.add_argument("--ckpt_path", type=str, required=True, help="Path to model checkpoint")
+    parser.add_argument("--save_path", type=str, required=True, help="Output path for predictions")
+    parser.add_argument("--receptive_field_radius", type=int, default=3, help="Receptive field radius")
+    parser.add_argument("--base_channels", type=int, default=128, help="Base channels")
+    parser.add_argument("--depth", type=int, default=12, help="Model depth")
+    parser.add_argument("--device", type=str, default="cuda", help="Device (cuda/cpu)")
+    args = parser.parse_args()
 
-    autoregressive_rollout(
-        sim_path=args.prepped_sim_path,
-        stats_path=args.stats_path,
-        ckpt_path=args.ckpt_path,
-        save_path=args.save_path,
+    rollout(
+        args.sim_path,
+        args.stats_path,
+        args.ckpt_path,
+        args.save_path,
         r=args.receptive_field_radius,
         base_channels=args.base_channels,
         depth=args.depth,
-        use_param_broadcast=args.use_param_broadcast,
         device=args.device,
     )
 

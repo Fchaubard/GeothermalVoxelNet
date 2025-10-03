@@ -222,11 +222,11 @@ Checkpoints save to `./checkpoints/`.
 
 ## Inference
 
-Autoregressive rollout on full simulation:
+Run autoregressive rollout on original simulation files (evaluates real deployment):
 
 ```bash
 python scripts/rollout_inference.py \
-  --prepped_sim_path ./data/prepped/test/v2.4_0001.prepped.h5 \
+  --sim_path /workspace/omv/data/v2.4_0001.h5 \
   --stats_path ./data/prepped/stats.json \
   --ckpt_path ./checkpoints/best_step10000.pt \
   --save_path ./predictions.h5 \
@@ -236,22 +236,52 @@ python scripts/rollout_inference.py \
 ```
 
 **What this does:**
-- Loads initial conditions (t=0) from prepped file
-- Autoregressively predicts t=1, t=2, ..., t=29
-- Each step: use predicted Pressure/Temperature as input for next step
-- Saves predictions to HDF5
+- Loads original v2.4 HDF5 file (not prepped patches)
+- Runs on full 326×70×76 grid (model is fully convolutional)
+- Starts from initial conditions (Pressure0, Temperature0 at t=0)
+- **Autoregressively predicts using its own outputs** (no ground truth reset)
+- At each timestep: predict → use prediction as input for next step
+- Evaluates error accumulation over 30 timesteps
+- Compares predictions vs ground truth to show drift
 
-**Output file structure:**
+**Key difference from training:**
+- **Training:** Uses ground truth at each timestep (teacher forcing)
+- **Inference:** Uses model's own predictions (autoregressive, real deployment)
+
+This shows what happens in production where you only have initial conditions.
+
+**Output:**
 ```
-predictions.h5:
-  predicted/outputs_grid   (30, 2, Z, Y, X)  - Pressure & Temperature predictions
-  predicted/outputs_scalar (30, 5)           - Field scalar predictions
+Console:
+  === Overall Metrics ===
+  Pressure MSE:     X.XXXe+XX
+  Temperature MSE:  X.XXXe+XX
+  Scalars MSE:      X.XXXe+XX
+
+  === Error Accumulation ===
+  Timestep | Pressure MSE | Temperature MSE | Pressure MAPE | Temperature MAPE
+  t=0      | ...          | ...             | ...           | ...
+  t=5      | ...          | ...             | ...           | ...
+  (shows how errors compound over time)
+
+File (predictions.h5):
+  predicted/Pressure        (30, 326, 70, 76)  - Model predictions
+  predicted/Temperature     (30, 326, 70, 76)
+  predicted/scalars         (30, 5)
+
+  ground_truth/Pressure     (30, 326, 70, 76)  - Ground truth for comparison
+  ground_truth/Temperature  (30, 326, 70, 76)
+  ground_truth/scalars      (30, 5)
+
+  metrics_overall           (attribute)        - JSON with overall MSE
+  metrics_per_timestep      (attribute)        - JSON with per-timestep metrics
 ```
 
-**Note:** Model is fully convolutional, so it can run on:
-- Small patches (32×32×32) during training
-- Full grid (326×70×76) during inference
-- Any grid size in between
+**Why autoregressive matters:**
+- During training, model sees perfect inputs (ground truth at t)
+- During inference, model sees its own imperfect predictions
+- Errors compound: small error at t=1 → larger error at t=2 → ...
+- This test reveals model stability and long-term prediction quality
 
 ## Metrics
 
