@@ -203,6 +203,26 @@ python scripts/train_ddp.py \
 | `--noise_std` | 0.01 | Gaussian noise std on inputs |
 | `--use_amp` | flag | Automatic mixed precision (fp16) |
 | `--num_workers` | 0 | DataLoader workers (keep 0 for HDF5) |
+| `--resume_from` | None | Path to checkpoint to resume training from |
+
+**Numerical stability safeguards:**
+- **Gradient clipping:** max_norm=1.0 to prevent gradient explosion
+- **NaN detection:** Input, loss, and gradient validation - skips corrupted batches automatically
+- **Checkpoints:** Include full training state (model, optimizer, scheduler, scaler, step)
+
+**Resume training after crash or NaN:**
+```bash
+torchrun --standalone --nproc_per_node=10 scripts/train_ddp.py \
+  --prepped_root ./data/prepped \
+  --batch_size 16 \
+  --receptive_field_radius 3 \
+  --base_channels 128 \
+  --depth 12 \
+  --max_steps 200000 \
+  --resume_from ./checkpoints/step58000.pt \
+  --use_amp \
+  --use_wandb
+```
 
 **Augmentations:**
 - **XY rotations:** 0°, 90°, 180°, 270° in horizontal plane

@@ -192,6 +192,7 @@ def main():
     ap.add_argument("--use_wandb", action="store_true")
     ap.add_argument("--wandb_project", type=str, default="voxel-ode")
     ap.add_argument("--wandb_run_name", type=str, default=None)
+    ap.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint to resume from")
 
     args = ap.parse_args()
     os.makedirs(args.save_dir, exist_ok=True)
@@ -301,6 +302,30 @@ def main():
     # AMP
     scaler = torch.cuda.amp.GradScaler(enabled=args.use_amp)
 
+    # Resume from checkpoint if specified
+    start_step = 0
+    if args.resume_from:
+        if os.path.exists(args.resume_from):
+            ddp_print(f"Loading checkpoint from {args.resume_from}")
+            checkpoint = torch.load(args.resume_from, map_location=device)
+
+            # Load model state
+            if use_ddp:
+                model.module.load_state_dict(checkpoint["model"])
+            else:
+                model.load_state_dict(checkpoint["model"])
+
+            # Load optimizer, scheduler, scaler state
+            opt.load_state_dict(checkpoint["optimizer"])
+            sched.load_state_dict(checkpoint["scheduler"])
+            if "scaler" in checkpoint:
+                scaler.load_state_dict(checkpoint["scaler"])
+
+            start_step = checkpoint["step"]
+            ddp_print(f"Resumed from step {start_step}")
+        else:
+            ddp_print(f"WARNING: Checkpoint {args.resume_from} not found, starting from scratch")
+
     # W&B
     run = None
     if args.use_wandb:
@@ -308,20 +333,21 @@ def main():
             import wandb
             run = wandb.init(project=args.wandb_project, name=args.wandb_run_name, config=vars(args))
 
-    # Evaluate at step 0
-    if use_ddp and isinstance(test_loader.sampler, DistributedSampler):
-        test_loader.sampler.set_epoch(0)
+    # Evaluate at step 0 (skip if resuming)
+    if start_step == 0:
+        if use_ddp and isinstance(test_loader.sampler, DistributedSampler):
+            test_loader.sampler.set_epoch(0)
 
-    ddp_print("Evaluating at step 0...")
-    metrics0 = evaluate(model, test_loader, device, stats, stats["log1p_flags"]["scalar"], max_batches=10)
-    if run and (not dist.is_initialized() or dist.get_rank() == 0):
-        for k, v in metrics0.items():
-            run.log({f"test/{k}": v, "step": 0})
-    if not dist.is_initialized() or dist.get_rank() == 0:
-        ddp_print("Initial test metrics:", metrics0)
+        ddp_print("Evaluating at step 0...")
+        metrics0 = evaluate(model, test_loader, device, stats, stats["log1p_flags"]["scalar"], max_batches=10)
+        if run and (not dist.is_initialized() or dist.get_rank() == 0):
+            for k, v in metrics0.items():
+                run.log({f"test/{k}": v, "step": 0})
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            ddp_print("Initial test metrics:", metrics0)
 
     # Training loop
-    global_step = 0
+    global_step = start_step
     best_val = float("inf")
     t0 = time.time()
 
@@ -338,6 +364,14 @@ def main():
             y_grid = batch["y_grid"].to(device, non_blocking=True)
             y_scalar = batch["y_scalar"].to(device, non_blocking=True)
 
+            # Check for NaN/inf in inputs
+            if torch.isnan(x_grid).any() or torch.isinf(x_grid).any():
+                ddp_print(f"WARNING: NaN/inf detected in input at step {global_step}, skipping batch")
+                continue
+            if torch.isnan(y_grid).any() or torch.isinf(y_grid).any():
+                ddp_print(f"WARNING: NaN/inf detected in target at step {global_step}, skipping batch")
+                continue
+
             with torch.cuda.amp.autocast(enabled=args.use_amp):
                 grid_pred, scalar_pred = model(x_grid, params)
                 loss_grid_p = torch.mean((grid_pred[:, 0] - y_grid[:, 0]) ** 2)
@@ -345,9 +379,27 @@ def main():
                 loss_scalar = torch.mean((scalar_pred - y_scalar) ** 2)
                 loss = loss_grid_p + loss_grid_T + loss_scalar
 
+            # Check for NaN loss
+            if torch.isnan(loss) or torch.isinf(loss):
+                ddp_print(f"WARNING: NaN/inf loss at step {global_step}, skipping batch")
+                ddp_print(f"  loss_grid_p: {loss_grid_p.item()}, loss_grid_T: {loss_grid_T.item()}, loss_scalar: {loss_scalar.item()}")
+                opt.zero_grad(set_to_none=True)
+                continue
+
             scaler.scale(loss / args.accum_steps).backward()
 
             if ((it + 1) % args.accum_steps) == 0:
+                # Gradient clipping for stability
+                scaler.unscale_(opt)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+                # Check for NaN gradients
+                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                    ddp_print(f"WARNING: NaN/inf gradients at step {global_step}, skipping update")
+                    opt.zero_grad(set_to_none=True)
+                    scaler.update()
+                    continue
+
                 scaler.step(opt)
                 scaler.update()
                 opt.zero_grad(set_to_none=True)
@@ -392,6 +444,9 @@ def main():
                             ckpt_path = os.path.join(args.save_dir, f"best_step{global_step}.pt")
                             state = {
                                 "model": model.module.state_dict() if hasattr(model, "module") else model.state_dict(),
+                                "optimizer": opt.state_dict(),
+                                "scheduler": sched.state_dict(),
+                                "scaler": scaler.state_dict(),
                                 "step": global_step,
                                 "best_val": best_val,
                                 "args": vars(args)
@@ -405,6 +460,9 @@ def main():
                         ckpt_path = os.path.join(args.save_dir, f"step{global_step}.pt")
                         state = {
                             "model": model.module.state_dict() if hasattr(model, "module") else model.state_dict(),
+                            "optimizer": opt.state_dict(),
+                            "scheduler": sched.state_dict(),
+                            "scaler": scaler.state_dict(),
                             "step": global_step,
                             "best_val": best_val,
                             "args": vars(args)

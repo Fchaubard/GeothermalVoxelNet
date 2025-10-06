@@ -75,7 +75,7 @@ class VoxelAutoRegressor(nn.Module):
         blocks = []
         for i in range(depth):
             # Vary dilation to extend receptive field
-            dilation = 1 if i < depth // 2 else 2
+            dilation = 1 #if i < depth // 2 else 2
             blocks.append(ResBlock3d(base_channels, dilation=dilation))
         self.trunk = nn.Sequential(*blocks)
 
