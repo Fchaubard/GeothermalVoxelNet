@@ -219,7 +219,7 @@ torchrun --standalone --nproc_per_node=10 scripts/train_ddp.py \
   --base_channels 128 \
   --depth 12 \
   --max_steps 200000 \
-  --resume_from ./checkpoints/step58000.pt \
+  --resume_from ./checkpoints/step50000.pt \
   --use_amp \
   --use_wandb
 ```

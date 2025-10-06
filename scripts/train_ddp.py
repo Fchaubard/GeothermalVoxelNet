@@ -315,11 +315,24 @@ def main():
             else:
                 model.load_state_dict(checkpoint["model"])
 
-            # Load optimizer, scheduler, scaler state
-            opt.load_state_dict(checkpoint["optimizer"])
-            sched.load_state_dict(checkpoint["scheduler"])
+            # Load optimizer, scheduler, scaler state if available (old checkpoints may not have these)
+            if "optimizer" in checkpoint:
+                opt.load_state_dict(checkpoint["optimizer"])
+                ddp_print("Loaded optimizer state")
+            else:
+                ddp_print("WARNING: Optimizer state not in checkpoint, using fresh optimizer")
+
+            if "scheduler" in checkpoint:
+                sched.load_state_dict(checkpoint["scheduler"])
+                ddp_print("Loaded scheduler state")
+            else:
+                ddp_print("WARNING: Scheduler state not in checkpoint, using fresh scheduler")
+
             if "scaler" in checkpoint:
                 scaler.load_state_dict(checkpoint["scaler"])
+                ddp_print("Loaded scaler state")
+            else:
+                ddp_print("WARNING: Scaler state not in checkpoint, using fresh scaler")
 
             start_step = checkpoint["step"]
             ddp_print(f"Resumed from step {start_step}")
